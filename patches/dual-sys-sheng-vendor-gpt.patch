@@ -1,0 +1,162 @@
+diff --git a/scripts/dual_sys/f2fs-shrink.c b/scripts/dual_sys/f2fs-shrink.c
+index 317bf60..4295aaa 100644
+--- a/scripts/dual_sys/f2fs-shrink.c
++++ b/scripts/dual_sys/f2fs-shrink.c
+@@ -28,6 +28,13 @@
+ #define F2FS_MAGIC 0xf2f52010U
+ #define F2FS_IOC_RESIZE_FS _IOW(0xf5, 16, uint64_t)
+ #define BLOCK_BYTES UINT64_C(4096)
++#define SUPER_BYTES 3072
++/* Packed field 0x684 (256 bytes) records the release of the kernel that last
++   mounted the filesystem. Each superblock copy keeps the release of whichever
++   kernel wrote it (sheng: 5.15.144 TWRP vs 5.15.195 MorizukiNeko), so compare
++   the copies with this stamp masked out. */
++#define KERNEL_STAMP_OFFSET 0x684
++#define KERNEL_STAMP_BYTES 256
+ #endif
+ #define SEG_BLOCKS UINT64_C(512)
+ 
+@@ -77,14 +84,23 @@ static uint64_t super_blocks(int fd)
+     const unsigned char *s = copies[0] + 1024;
+     const unsigned char *t = copies[1] + 1024;
+     /* shortcut: single-device, one segment per section; review other layouts before extending. */
+-    if (memcmp(s, t, 3072) || le32(s) != F2FS_MAGIC || le32(s + 16) != 12 ||
+-        le32(s + 20) != 9 || le32(s + 24) != 1 ||
+-        le32(s + 8) + le32(s + 12) != 12 ||
+-        le32(s + 8) < 9 || le32(s + 8) > 12)
++    for (unsigned i = 0; i < 2; i++) {
++        const unsigned char *c = copies[i] + 1024;
++        if (le32(c) != F2FS_MAGIC || le32(c + 16) != 12 || le32(c + 20) != 9 ||
++            le32(c + 24) != 1 || le32(c + 8) + le32(c + 12) != 12 ||
++            le32(c + 8) < 9 || le32(c + 8) > 12)
++            fail("unsupported F2FS geometry or disagreeing superblocks");
++        /* devs[0].path begins at byte 2201 in the packed F2FS superblock. */
++        if (c[2201] || (le32(c + 2180) & 2))
++            fail("multi-device or zoned F2FS is unsupported");
++    }
++    unsigned char masked[2][SUPER_BYTES];
++    memcpy(masked[0], s, SUPER_BYTES);
++    memcpy(masked[1], t, SUPER_BYTES);
++    memset(masked[0] + KERNEL_STAMP_OFFSET, 0, KERNEL_STAMP_BYTES);
++    memset(masked[1] + KERNEL_STAMP_OFFSET, 0, KERNEL_STAMP_BYTES);
++    if (memcmp(masked[0], masked[1], SUPER_BYTES))
+         fail("unsupported F2FS geometry or disagreeing superblocks");
+-    /* devs[0].path begins at byte 2201 in the packed F2FS superblock. */
+-    if (s[2201] || (le32(s + 2180) & 2))
+-        fail("multi-device or zoned F2FS is unsupported");
+     return le64(s + 36);
+ }
+ 
+diff --git a/scripts/dual_sys/gpt.py b/scripts/dual_sys/gpt.py
+index aaf876f..aa3f0fa 100644
+--- a/scripts/dual_sys/gpt.py
++++ b/scripts/dual_sys/gpt.py
+@@ -36,7 +36,15 @@ def header(data, sector, lba, total):
+     require(width == 128 and 1 <= count <= 4096, 'unsupported GPT entry geometry')
+     # GPT reserves at least 16 KiB even when the header declares fewer entries.
+     blocks = (max(16384, count * width) + sector - 1) // sector
+-    require(table == (2 if lba == 1 else total - 1 - blocks), 'non-contiguous GPT tables are unsupported')
++    if lba == 1:
++        require(table == 2, 'non-contiguous GPT tables are unsupported')
++    else:
++        # Xiaomi sheng places the backup entry array short of the standard
++        # position (LBA 64007161, 4096-byte sectors) while the header still
++        # lives in the last sector. Follow the header as long as the array
++        # stays after the usable range and before the backup header; a
++        # standard layout (table == total - 1 - blocks) still passes.
++        require(last < table <= total - 1 - blocks, 'non-contiguous GPT tables are unsupported')
+     require(2 + blocks <= first <= last < total - 1 - blocks, 'GPT usable range overlaps metadata')
+     require(guid != bytes(16), 'missing GPT disk GUID')
+     return dict(first=first, last=last, guid=guid, table=table, count=count, blocks=blocks, crc=table_crc)
+@@ -46,7 +54,11 @@ def read_gpt(read, sector, total):
+     """read(lba, count) returns exact raw logical sectors, without shell output."""
+     h = header(read(1, 1), sector, 1, total)
+     primary = read(0, 2 + h['blocks'])
+-    backup = read(total - 1 - h['blocks'], 1 + h['blocks'])
++    backup_head = read(total - 1, 1)
++    b = header(backup_head, sector, total - 1, total)
++    # The logical backup region is the declared entry array followed by the
++    # header, wherever the vendor placed the array.
++    backup = read(b['table'], h['blocks']) + backup_head
+     return GPT(primary, backup, sector, total)
+ 
+ 
+@@ -56,6 +68,7 @@ class GPT:
+         self.primary, self.backup = primary, backup
+         h = header(primary[sector:2 * sector], sector, 1, total)
+         b = header(backup[-sector:], sector, total - 1, total)
++        self.bh = b
+         require(len(primary) == (2 + h['blocks']) * sector and
+                 len(backup) == (1 + h['blocks']) * sector, 'short GPT regions')
+         require(all(h[k] == b[k] for k in ('first', 'last', 'guid', 'count', 'blocks', 'crc')),
+@@ -116,6 +129,7 @@ class GPT:
+         return bytes(primary), bytes(backup), dict(
+             userdata_index=userdata_index, unixnu_index=empty, userdata_start=user['start'],
+             userdata_end=start - 1, unixnu_start=start, unixnu_end=end,
++            backup_table_lba=self.bh['table'], backup_header_lba=self.total - 1,
+             old_userdata_bytes=(user['end'] - user['start'] + 1) * self.sector,
+             new_userdata_bytes=(start - user['start']) * self.sector,
+             unixnu_bytes=requested, tail_gap_bytes=(user['end'] - end) * self.sector)
+diff --git a/scripts/dual_sys/partition.py b/scripts/dual_sys/partition.py
+index 2f056e7..5936c5a 100644
+--- a/scripts/dual_sys/partition.py
++++ b/scripts/dual_sys/partition.py
+@@ -132,8 +132,8 @@ def prepare(adb, args, info, gpt):
+     variables = dict(DISK=info['disk'], RAW=info['raw'], MAPPED=fs['mapped'],
+                      HARDWARE_SERIAL=info['hardware_serial'], KERNEL=info['kernel'],
+                      DISK_BYTES=info['total_bytes'], SECTOR=info['sector'],
+-                     BACKUP_LBA=gpt.total - 1 - gpt.h['blocks'],
+-                     PRIMARY_BLOCKS=2 + gpt.h['blocks'], BACKUP_BLOCKS=1 + gpt.h['blocks'],
++                     BACKUP_HEADER_LBA=gpt.total - 1, BACKUP_TABLE_LBA=gpt.bh['table'],
++                     PRIMARY_BLOCKS=2 + gpt.h['blocks'], TABLE_BLOCKS=gpt.h['blocks'],
+                      OLD_BYTES=layout['old_userdata_bytes'], OLD_BLOCKS=before,
+                      EXPECTED_BLOCKS=after, LIMIT_BLOCKS=limit,
+                      USER_START_512=start // 512,
+@@ -146,6 +146,8 @@ def prepare(adb, args, info, gpt):
+     (output / 'plan.env').write_text(''.join(f'{k}={shlex.quote(str(v))}\n' for k, v in variables.items()),
+                                    encoding='utf-8', newline='\n')
+     plan = dict(identity=info, filesystem=fs, layout=layout, remote=remote,
++                gpt=dict(header_lba=gpt.total - 1, table_lba=gpt.bh['table'],
++                         table_blocks=gpt.h['blocks']),
+                 expected_blocks=after, limit_blocks=limit)
+     (output / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n', encoding='utf-8', newline='\n')
+     files = sorted(p for p in output.iterdir() if p.is_file())
+@@ -159,6 +161,8 @@ def prepare(adb, args, info, gpt):
+     print(f"Remaining userdata: {layout['new_userdata_bytes'] / (1 << 30):.6f} GiB")
+     print(f"Alignment gap after unixnu: {layout['tail_gap_bytes']} bytes")
+     print(f'F2FS blocks: {before} -> {after}; partition limit: {limit}')
++    print(f"Backup GPT: table LBA {gpt.bh['table']} ({gpt.h['blocks']} sectors), "
++          f"header LBA {gpt.total - 1}")
+     print(f'Host bundle and original GPT: {output}\nRecovery bundle: {remote}')
+     adb.run('shell', f'sh {remote}/twrp.sh check')
+     if args.command == 'plan':
+diff --git a/scripts/dual_sys/twrp.sh b/scripts/dual_sys/twrp.sh
+index 049efbe..4e91983 100644
+--- a/scripts/dual_sys/twrp.sh
++++ b/scripts/dual_sys/twrp.sh
+@@ -25,7 +25,9 @@ serial=$(getprop ro.serialno)
+ 
+ compare_gpt() {
+     dd if="$DISK" of=primary.read bs="$SECTOR" count="$PRIMARY_BLOCKS" 2>/dev/null
+-    dd if="$DISK" of=backup.read bs="$SECTOR" skip="$BACKUP_LBA" count="$BACKUP_BLOCKS" 2>/dev/null
++    dd if="$DISK" of=backup.table.read bs="$SECTOR" skip="$BACKUP_TABLE_LBA" count="$TABLE_BLOCKS" 2>/dev/null
++    dd if="$DISK" of=backup.header.read bs="$SECTOR" skip="$BACKUP_HEADER_LBA" count=1 2>/dev/null
++    cat backup.table.read backup.header.read > backup.read
+     cmp primary.read "gpt-primary.$1" || stop 'primary GPT differs'
+     cmp backup.read "gpt-backup.$1" || stop 'backup GPT differs'
+ }
+@@ -59,9 +61,12 @@ compare_gpt before
+ 
+ # Update the backup first. Keep MBR and all untouched partition entries byte-identical.
+ echo 'Writing backup GPT' > stage
+-dd if=gpt-backup.after of="$DISK" bs="$SECTOR" seek="$BACKUP_LBA" conv=notrunc
++dd if=gpt-backup.after of="$DISK" bs="$SECTOR" seek="$BACKUP_TABLE_LBA" count="$TABLE_BLOCKS" conv=notrunc
++dd if=gpt-backup.after of="$DISK" bs="$SECTOR" skip="$TABLE_BLOCKS" seek="$BACKUP_HEADER_LBA" count=1 conv=notrunc
+ sync
+-dd if="$DISK" of=backup.read bs="$SECTOR" skip="$BACKUP_LBA" count="$BACKUP_BLOCKS" 2>/dev/null
++dd if="$DISK" of=backup.table.read bs="$SECTOR" skip="$BACKUP_TABLE_LBA" count="$TABLE_BLOCKS" 2>/dev/null
++dd if="$DISK" of=backup.header.read bs="$SECTOR" skip="$BACKUP_HEADER_LBA" count=1 2>/dev/null
++cat backup.table.read backup.header.read > backup.read
+ cmp backup.read gpt-backup.after || stop 'backup GPT readback failed; do not reboot'
+ echo 'Backup GPT verified; writing primary GPT' > stage
+ dd if=gpt-primary.after of="$DISK" bs="$SECTOR" conv=notrunc
