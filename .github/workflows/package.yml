@@ -136,6 +136,8 @@ jobs:
         run: |
           # fetch-sources.py adds leading-slash patterns, which the runner's git rejects in cone
           # mode. Clone the locked sources in no-cone mode first; the script then verifies and fills them.
+          # A branch ref can advance past the locked commit (freebsd releng/15.1), so pin HEAD to the
+          # locked sha by fetching it directly when the clone head differs.
           python3 - <<'PY'
           import json, subprocess
           lock = json.load(open('tools/source-lock.json'))
@@ -145,6 +147,14 @@ jobs:
                               '--sparse', source['url'], directory], check=True)
               subprocess.run(['git', '-C', directory, 'sparse-checkout', 'set', '--no-cone', '/.unixnu-placeholder'],
                              check=True)
+              head = subprocess.run(['git', '-C', directory, 'rev-parse', 'HEAD'],
+                                    capture_output=True, text=True, check=True).stdout.strip()
+              if head != source['commit']:
+                  print(name + ": clone head " + head + " differs from the locked "
+                        + source['commit'] + "; fetching the locked commit")
+                  subprocess.run(['git', '-C', directory, 'fetch', '--depth', '1', 'origin', source['commit']],
+                                 check=True)
+                  subprocess.run(['git', '-C', directory, 'checkout', '-q', 'FETCH_HEAD'], check=True)
           PY
           python3 tools/fetch-sources.py
       - name: keyboard and video firmware
